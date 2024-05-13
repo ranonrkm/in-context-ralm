@@ -26,7 +26,7 @@ def main(args):
     print("Loading dataset...")
     if args.load_from == "hf":
         dataset = load_dataset(args.dataset_path, args.dataset_name, split=args.dataset_split)
-        dataset = "".join([x["text"] if x["text"] else " \n" for x in dataset])
+        dataset = "".join([x[args.text_col] if x[args.text_col] else " \n" for x in dataset])
     else:
         with open(args.dataset_path, "r") as f:
             dataset = f.read()
@@ -89,6 +89,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_split", type=str, default="test")
+    parser.add_argument("--text_col", type=str, default="text")
 
     # Model params
     parser.add_argument("--tokenizer_name", type=str, default="gpt2")

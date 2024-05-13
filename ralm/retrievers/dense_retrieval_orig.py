@@ -1,26 +1,56 @@
-import json
-import multiprocessing
+import numpy as np
+import torch
 
+from pyserini.search.faiss import *
 from ralm.retrievers.base_retrieval import BaseRetriever
-from pyserini.search.lucene import LuceneSearcher
 
+encoder_class_map = {
+    "dkrr": DkrrDprQueryEncoder,
+    "cosdpr": CosDprQueryEncoder,
+    "dpr": DprQueryEncoder,
+    "bpr": BprQueryEncoder,
+    "tct_colbert": TctColBertQueryEncoder,
+    "ance": AnceQueryEncoder,
+    "sentence": AutoQueryEncoder,
+    "contriever": AutoQueryEncoder,
+    "aggretriever": AggretrieverQueryEncoder,
+    "openai-api": OpenAIQueryEncoder,
+    "auto": AutoQueryEncoder,
+    "clip": ClipQueryEncoder,
+}
 
-class SparseRetriever(BaseRetriever):
-    def __init__(self, tokenizer, index_name, num_tokens_for_query, forbidden_titles_path):
-        super(SparseRetriever, self).__init__(tokenizer=tokenizer)
-        self.searcher = self._get_searcher(index_name)
+class DenseRetriever(BaseRetriever):
+    def __init__(self, tokenizer, 
+                 query_encoder_name, query_encoder_class, 
+                 num_tokens_for_query,
+                 index_name, forbidden_titles_path):
+        super(DenseRetriever, self).__init__(tokenizer=tokenizer)
+        self.searcher = self._get_searcher(query_encoder_name, query_encoder_class, index_name)
         self.num_tokens_for_query = num_tokens_for_query
 
         self.forbidden_titles = self._get_forbidden_titles(forbidden_titles_path)
 
-    def _get_searcher(self, index_name):
+    def _get_searcher(self, enc_name, enc_cls_name, index_name):
         try:
             print(f"Attempting to download the index as if prebuilt by pyserini")
-            return LuceneSearcher.from_prebuilt_index(index_name)
+            enc_cls = enc_cls_map[enc_cls_name]
+            kwargs = dict(encoder_dir=enc_name, device=self.device)
+            if (_encoder_class == "sentence") or ("sentence" in encoder):
+                kwargs.update(dict(pooling='mean', l2_norm=True))
+            if (_encoder_class == "contriever") or ("contriever" in encoder):
+                kwargs.update(dict(pooling='mean', l2_norm=False))
+            if (_encoder_class == "openai-api") or ("openai" in encoder):
+                kwargs.update(dict(max_length=max_length))
+            if (_encoder_class == "auto"):
+                kwargs.update(dict(pooling=pooling, l2_norm=l2_norm, prefix=prefix))
+            if (_encoder_class == "clip") or ("clip" in encoder):
+                kwargs.update(dict(l2_norm=True, prefix=prefix, multimodal=multimodal))
+            encoder = enc_cls(**kwargs)
+            return FaissSearcher(index_name, encoder)
         except ValueError:
             print(f"Index does not exist in pyserini.")
             print("Attempting to treat the index as a directory (not prebuilt by pyserini)")
-            return LuceneSearcher(index_name)
+            return FaissSearcher(index_name)
 
     def _get_forbidden_titles(self, forbidden_titles_path):
         if forbidden_titles_path is None:
@@ -80,12 +110,7 @@ class SparseRetriever(BaseRetriever):
             d["query"] = queries[qid]
             allowed_docs = []
             for hit in res:
-                res_dict = json.loads(hit.lucene_document.get('raw'))
-                context_str = res_dict["contents"]
-                title = self._get_title_from_retrieved_document(context_str)
-                if title not in self.forbidden_titles:
-                    allowed_docs.append({"text": context_str, "score": hit.score})
-                    if len(allowed_docs) >= k:
-                        break
-            d["retrieved_docs"] = allowed_docs
-        return dataset
+                res_dict = 
+        
+
+

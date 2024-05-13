@@ -1,0 +1,5 @@
+128
+Max context length: 1024
+Dataset length: 285234
+Normalization factor (num tokens/words..): 245569
+Perplexity: 37.617408752441406

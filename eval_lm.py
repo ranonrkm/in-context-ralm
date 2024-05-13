@@ -11,7 +11,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 from ralm.file_utils import print_args
-from ralm.model_utils import load_model_and_tokenizer
+from ralm.model_utils import load_model_and_tokenizer, load_knnlm_and_tokenizer
 
 
 def evaluate_logprob_with_retrieved_docs(
@@ -47,6 +47,7 @@ def evaluate_logprob_with_retrieved_docs(
     labels_for_ranking = input_ids.clone()
     assert input_ids.size() == (num_docs, end_loc-begin_loc)
 
+    import pdb; pdb.set_trace()
     for doc_id in range(num_docs):
         retrieved_example = retrieved_item["retrieved_docs"][doc_id]
 
@@ -125,6 +126,9 @@ def eval_dataset(
 
     print("Normalization factor (num tokens/words..):", counter)
 
+    # for KNN-LM
+    knn_lambda = getattr(model, "knn_lambda", 0.0)
+
     nlls = []
     prev_end_loc = 0
 
@@ -154,6 +158,10 @@ def eval_dataset(
             target_ids = input_ids.clone()
             target_ids[:, :-trg_len] = -100
 
+            if idx == 0:
+                setattr(model, "knn_lambda", 0.0)
+            else:
+                setattr(model, "knn_lambda", knn_lambda)
             with torch.no_grad():
                 outputs = model(input_ids, labels=target_ids)
 
@@ -173,7 +181,7 @@ def eval_dataset(
                 loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1)).cpu()
                 token_ppls = loss.tolist()
                 tokens_to_predict = labels.view(-1).cpu().tolist()
-
+            
         nlls.append(neg_log_likelihood)
         all_token_ppls.append(token_ppls)
         all_tokens_to_predict.append(tokens_to_predict)
@@ -206,12 +214,21 @@ def eval_dataset(
 
 def main(args):
     if args.output_dir is not None:
-        os.makedirs(args.output_dir)
+        os.makedirs(args.output_dir, exist_ok=True)
     print_args(args, output_dir=args.output_dir)
 
-    model, tokenizer, config, device = load_model_and_tokenizer(
-        args.model_name, model_parallelism=args.model_parallelism, cache_dir=args.cache_dir, auth_token=args.auth_token
-    )
+    if args.use_knn:
+        assert args.knnlm_index_path is not None and args.knnlm_vals_path is not None, "KNN-LM index and vals paths are required"
+        model, tokenizer, config, device = load_knnlm_and_tokenizer(
+            args.model_name, 
+            args.knnlm_index_path, args.knnlm_vals_path, k=args.knnlm_topk, knn_lambda=args.knn_lambda, 
+            model_parallelism=args.model_parallelism, cache_dir=args.cache_dir,
+            auth_token=args.auth_token
+        )
+    else:
+        model, tokenizer, config, device = load_model_and_tokenizer(
+            args.model_name, model_parallelism=args.model_parallelism, cache_dir=args.cache_dir, auth_token=args.auth_token
+        )
 
     # Model context size (e.g., 1024 for GPT-2)
     max_length = args.max_length
@@ -221,7 +238,7 @@ def main(args):
 
     if args.load_from == "hf":
         dataset = load_dataset(args.dataset_path, args.dataset_name, split=args.dataset_split)
-        dataset = "".join([x["text"] if x["text"] else " \n" for x in dataset])
+        dataset = "".join([x[args.text_col] if x[args.text_col] else " \n" for x in dataset])
     else:
         with open(args.dataset_path, "r") as f:
             dataset = f.read()
@@ -267,6 +284,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_split", type=str, default="test")
+    parser.add_argument("--text_col", type=str, default="text")
     parser.add_argument("--normalization_level", choices=["word", "token"], default="word")
 
     # retrieval params
@@ -275,6 +293,13 @@ if __name__ == '__main__':
     parser.add_argument("--ranking_strategy", type=str, choices=["first", "logprob", "oracle", "random"], default="first")
     parser.add_argument("--num_docs_to_rank", type=int, default=-1)
     parser.add_argument("--ranking_logprob_past_tokens", type=int, default=16)
+
+    # KNN-LM args
+    parser.add_argument("--use_knn", action="store_true")
+    parser.add_argument("--knnlm_index_path", type=str, default=None)
+    parser.add_argument("--knnlm_vals_path", type=str, default=None)
+    parser.add_argument("--knn_lambda", type=float, default=0.25)
+    parser.add_argument("--knnlm_topk", type=int, default=1024) 
 
     args = parser.parse_args()
 
