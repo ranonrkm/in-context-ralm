@@ -6,7 +6,7 @@ import torch
 import faiss
 import faiss.contrib.torch_utils
 
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
 
 from tqdm import tqdm
@@ -94,7 +94,7 @@ class DenseRetriever:
     def __init__(self, query_enc, tokenizer, num_tokens_for_query, 
                  dataset_name, index_path, text_col="text",
                  pooling_strategy='mean', device='cuda',
-                 nprobe=32, gpu_index=False):
+                 nprobe=64, gpu_index=False):
         self.encoder = AutoEmbeddingModel(query_enc, device, pooling_strategy=pooling_strategy)
         self.lm_tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         
@@ -115,10 +115,14 @@ class DenseRetriever:
         dataset_name, dataset_version = dataset_name.split(":")
         self.dataset = load_dataset(dataset_name, dataset_version, split="train", 
                                     cache_dir='/data/user_data/rsadhukh/cache')
-
         print("splitting docs...")
-        self.dataset = self.dataset.map(partial(split_documents, n=200), 
+        datashards = []
+        for i in range(8):
+            datashard = self.dataset.shard(index=i, num_shards=8)
+            datashard = datashard.map(partial(split_documents, n=200),
                                         batched=True, num_proc=8, remove_columns=self.dataset.column_names)
+            datashards.append(datashard)
+        self.dataset = concatenate_datasets(datashards)
         print("done splitting docs")
         
         assert self.index.ntotal == len(self.dataset), f"Index size {self.index.ntotal} != dataset size {len(self.dataset)}"
@@ -144,14 +148,12 @@ class DenseRetriever:
             )
             for d in dataset
         ]
-        import pdb; pdb.set_trace()
         assert len(queries) == len(dataset)
 
         for begin in tqdm(range(0, len(queries), batch_size)):
             end = min(begin + batch_size, len(queries))
             embs = self.encoder(queries[begin :  end]).cpu().float().numpy()
             scores, ids = self.index.search(embs, k)
-            import pdb; pdb.set_trace()
             cur_texts = self.dataset.select(ids.flatten())['text']
             for qid in range(begin, end):
                 d = dataset[qid]

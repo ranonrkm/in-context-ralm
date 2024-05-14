@@ -1,3 +1,5 @@
+import copy
+from typing import List
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -159,3 +161,103 @@ def load_knnlm_and_tokenizer(model_name,
     knnlm = KNNLM(tokenizer, model, index, vals, k=k, knn_lambda=knn_lambda, device=device)
 
     return knnlm, tokenizer, config, device
+
+
+class TTTLM:
+    def __init__(self, tokenizer, model, 
+                 tr_batch_size=1, max_tr_niters=10, 
+                 lr=5e-6, adam_epsilon=1e-8, device='cuda:0'):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = device
+        self.block_size = model.config.max_position_embeddings
+        self.stride = self.block_size // 2
+        self._orig_state = copy.deepcopy(model.state_dict())
+        self.tr_batch_size = tr_batch_size
+        self.max_tr_niters = max_tr_niters
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=lr, eps=adam_epsilon
+        )
+        self.model.to(device)
+
+    def _reset_model(self):
+        self.model.load_state_dict(self._orig_state)
+
+    def finetune(self, train_input_ids):
+        train_input_ids, train_labels = self.group_texts(train_input_ids)
+        self.model.train()
+        niter = 0
+        begin = 0
+        while niter < self.max_tr_niters:
+            end = min(begin + self.tr_batch_size, len(train_input_ids))
+            self.optimizer.zero_grad()
+            input_ids_batch = train_input_ids[begin : end].to(self.device)
+            labels_batch = train_labels[begin : end].to(self.device)
+            outputs = self.model(input_ids_batch, labels=labels_batch)
+            loss = outputs.loss
+            loss.backward()
+            self.optimizer.step()
+            niter += 1
+            begin = end
+            if begin >= len(train_input_ids):
+                begin = 0
+        self.model.eval()
+
+    def group_texts(self, all_token_ids: List[int]):
+        input_ids = []
+        labels = []
+        padding_index = -100
+        total_length = len(all_token_ids)
+        if total_length >= self.block_size:
+            total_length = (total_length // self.block_size) * self.block_size
+        for i in range(0, total_length, self.stride):
+            begin_loc = max(i + self.stride - self.block_size, 0)
+            end_loc = min(i + self.stride, total_length)
+            trg_len = end_loc - i
+            cur_input_ids = all_token_ids[begin_loc:end_loc]
+            cur_labels = list(cur_input_ids)
+            cur_labels[:-trg_len] = [padding_index] * (len(cur_input_ids) - trg_len)
+
+            if len(cur_input_ids) < self.block_size:
+                padding_size = self.block_size - len(cur_input_ids)
+                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+                cur_input_ids += [pad_token_id] * padding_size
+                cur_labels += [padding_index] * padding_size
+            
+            input_ids.append(cur_input_ids)
+            labels.append(cur_labels)
+
+            return torch.LongTensor(input_ids), torch.LongTensor(labels)
+
+    def __call__(self, input_ids, labels=None):
+        res = self.model(input_ids, labels=labels)
+        self._reset_model()
+        return res
+        
+def load_tttlm_and_tokenizer(model_name, model_parallelism=False, cache_dir=None, auth_token=None):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device_count = torch.cuda.device_count()
+
+    config = AutoConfig.from_pretrained(model_name)
+    model_args = {}
+    if cache_dir is not None:
+        model_args["cache_dir"] = cache_dir
+    if model_parallelism:
+        model_args["device_map"] = "auto"
+        model_args["low_cpu_mem_usage"] = True
+    if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
+        model_args["torch_dtype"] = config.torch_dtype
+    if auth_token is not None:
+        model_args["use_auth_token"] = auth_token
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_args).eval()
+    if not model_parallelism:
+        model = model.to(device)
+    tokenizer = load_tokenizer(model_name)
+
+    if device_count > 1 and not model_parallelism:
+        model = torch.nn.DataParallel(model)
+
+    tttlm = TTTLM(tokenizer, model, device=device)
+
+    return tttlm, tokenizer, config, device

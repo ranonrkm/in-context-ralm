@@ -49,7 +49,7 @@ RETRIEVAL_FILE=/data/user_data/rsadhukh/wikitext/retrieved_stride${stride}
 # --forbidden_titles_path ralm/retrievers/wikitext103_forbidden_titles.txt \
 # --stride $stride \
 # --output_file $RETRIEVAL_FILE \
-# --num_tokens_for_query 32 \
+# --query_seq_len 128 \
 # --num_docs 16
 
 stride=64
@@ -60,14 +60,14 @@ python3 prepare_retrieval_data.py \
 --retrieval_type dense \
 --model_name $ENC_NAME \
 --tokenizer_name $MODEL_NAME \
---index_path /data/user_data/rsadhukh/wikipedia/facebook/dragon-plus-context-encoder \
+--index_path /data/user_data/rsadhukh/wikipedia/facebook/dragon-plus-context-encoder/index_OPQ64_256_IVF4096_PQ64.indexed \
 --datastore_name wikipedia:20220301.en \
 --max_length 1024 \
 --dataset_path wikitext \
 --dataset_name wikitext-103-v1 \
 --dataset_split test \
 --text_col text \
---query_seq_len 512 \
+--query_seq_len 128 \
 --stride $stride \
 --output_file $RETRIEVAL_FILE \
 --num_docs 16

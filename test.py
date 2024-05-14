@@ -3,7 +3,7 @@ from functools import partial
 import numpy as np
 import torch
 import faiss
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
 
 class AutoEmbeddingModel:
@@ -13,10 +13,11 @@ class AutoEmbeddingModel:
                                                 cache_dir="/data/user_data/rsadhukh/cache").to(device)
         self.device = device
         self.pool_strategy = pooling_strategy
+        self.block_size = self.model.config.max_position_embeddings
 
     def __call__(self, texts: List[str]) -> torch.Tensor:
         with torch.no_grad():
-            tokens = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt', max_length=512)
+            tokens = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt', max_length=self.block_size)
             input_ids = tokens['input_ids'].to(self.device)
             attention_mask = tokens['attention_mask'].to(self.device)
             output = self.model(input_ids, attention_mask=attention_mask)
@@ -45,7 +46,7 @@ def split_documents(documents: dict, n=200, text_col="text") -> dict:
 
 class MultiIndex:
     def __init__(self, index_dir):
-        self.indices = [faiss.read_index(f"{index_dir}/index_{i}.index") for i in range(8)]
+        self.indices = [faiss.read_index(f"{index_dir}/index_{i}.index") for i in range(4)]
         ntotals = [0] + [index.ntotal for index in self.indices][:-1]
         self.ntotals = np.cumsum(ntotals)
         self.ntotal = sum(ntotals)
@@ -70,17 +71,24 @@ device="cuda:0"
 encoder = AutoEmbeddingModel(query_enc, device, pooling_strategy='cls')
 
 datastore = load_dataset("wikipedia", "20220301.en", split="train", cache_dir="/data/user_data/rsadhukh/cache")
-datastore = datastore.map(partial(split_documents, n=200), 
-                                    batched=True, num_proc=8, remove_columns=datastore.column_names)
+
+datashards = []
+for i in range(4):
+    datashard = datastore.shard(index=i, num_shards=8)
+    datashard = datashard.map(partial(split_documents, n=200),
+                                batched=True, num_proc=8, remove_columns=datastore.column_names)
+    datashards.append(datashard)
+
+datastore = concatenate_datasets(datashards)
 
 prefixed_dataset = load_from_disk("/data/user_data/rsadhukh/wikipedia/facebook/dragon-plus-context-encoder/prefixed_query_annotated")
 
-# index = faiss.read_index('/data/user_data/rsadhukh/wikipedia/facebook/dragon-plus-context-encoder/index_OPQ64_256_IVF4096_PQ64.indexed')
-# index.nprobe = 128
+index = faiss.read_index('/data/user_data/rsadhukh/wikipedia/facebook/dragon-plus-context-encoder/index_OPQ64_256_IVF4096_PQ64.indexed')
+index.nprobe = 64
 
-index_dir='/data/user_data/rsadhukh/wikipedia/facebook/dragon-plus-context-encoder'
-indexes = [faiss.read_index(f"{index_dir}/index_{i}.index") for i in range(8)]
-index = MultiIndex(index_dir)
+# index_dir='/data/user_data/rsadhukh/wikipedia/facebook/dragon-plus-context-encoder'
+# indexes = [faiss.read_index(f"{index_dir}/index_{i}.index") for i in range(8)]
+# index = MultiIndex(index_dir)
 print("ntotal", index.ntotal)
 
 query = prefixed_dataset[:3]['prefix']

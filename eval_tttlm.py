@@ -11,8 +11,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 from ralm.file_utils import print_args
-from ralm.model_utils import load_model_and_tokenizer, load_knnlm_and_tokenizer
-
+from ralm.model_utils import load_tttlm_and_tokenizer
 
 def evaluate_logprob_with_retrieved_docs(
         model,
@@ -23,30 +22,14 @@ def evaluate_logprob_with_retrieved_docs(
         end_loc,
         trg_len,
         retrieved_item,
-        ranking_strategy,
-        num_tokens_to_rank,
-        retrieval_max_length,
-        num_docs=-1
+        num_docs=10
 ):
+
     input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
 
-    if ranking_strategy == "first":
-        assert num_docs in [-1, 1], f"In 'first' ranking strategy, unexpected number of docs to rank: {num_docs}"
-        num_docs = 1
-        chosen_doc_id = 0
-    elif ranking_strategy == "random":
-        chosen_doc_id = np.random.randint(num_docs)
-        retrieved_item["retrieved_docs"] = [retrieved_item["retrieved_docs"][chosen_doc_id]]
-        num_docs = 1
+    num_docs = len(retrieved_item["retrieved_docs"])
 
-    num_docs_in_retrieved = len(retrieved_item["retrieved_docs"])
-    num_docs = min(num_docs, num_docs_in_retrieved) if num_docs > 0 else num_docs_in_retrieved
-
-    input_ids = input_ids.repeat(num_docs, 1)
-    target_ids = input_ids.clone()
-    labels_for_ranking = input_ids.clone()
-    assert input_ids.size() == (num_docs, end_loc-begin_loc)
-
+    retrieved_texts = []
     for doc_id in range(num_docs):
         retrieved_example = retrieved_item["retrieved_docs"][doc_id]
 
@@ -54,44 +37,29 @@ def evaluate_logprob_with_retrieved_docs(
         doc_text = retrieved_example["text"]
         if doc_title:
             doc_text = doc_title + "\n" + doc_text
-        encoded_retrieved_text = tokenizer.encode(doc_text, max_length=retrieval_max_length, truncation=True)
+        retrieved_texts.append(doc_text)
 
-        input_ids[doc_id, :len(encoded_retrieved_text)] = torch.tensor(encoded_retrieved_text, device=device)
+    # concat the retrieved texts
+    retrieved_texts = " ".join(retrieved_texts)
+    encoded_retrieved_text = tokenizer(retrieved_texts)["input_ids"]
 
+    labels = input_ids.clone()[0, -trg_len:]    
     loss_fct = CrossEntropyLoss(reduction="none")
 
     with torch.no_grad():
-        lm_logits = model(input_ids).logits
+        pre_lm_logits= model(input_ids).logits[0, -trg_len-1:-1, :]
+        pre_token_ppls = loss_fct(pre_lm_logits, labels).cpu()
+        
+    model.finetune(encoded_retrieved_text)
 
-        # Rank:
-        if ranking_strategy in ["first", "random"]:
-            batch_doc_id = 0
-        else:
-            if ranking_strategy == "oracle":
-                labels_for_ranking[:, :-trg_len] = -100
-                num_tokens_to_rank = trg_len  # We override this variable as it's not really relevant in oracle setting
-            else:
-                labels_for_ranking[:, :-trg_len-num_tokens_to_rank] = -100
-                labels_for_ranking[:, -trg_len:] = -100
-            labels_for_ranking = labels_for_ranking[:, 1:]
-            assert torch.sum(labels_for_ranking[0] != -100).cpu().item() == num_tokens_to_rank
+    with torch.no_grad():
+        post_lm_logits = model(input_ids).logits[0, -trg_len-1:-1, :]
+        post_token_ppls = loss_fct(post_lm_logits, labels).cpu()
 
-            lm_logits_for_ranking = lm_logits[..., :-1, :]
-            ranking_loss = loss_fct(lm_logits_for_ranking.reshape(-1, lm_logits_for_ranking.size(-1)), labels_for_ranking.reshape(-1))
-            ranking_loss = ranking_loss.view(num_docs, -1)
-            per_doc_ranking_loss = torch.sum(ranking_loss, dim=-1)
-            chosen_doc_id = torch.argmin(per_doc_ranking_loss).cpu().item()
-            batch_doc_id = chosen_doc_id
+    tokens_to_predict = labels.view(-1).cpu().tolist()
 
-        # Calculate logprob of the chosen doc:
-        lm_logits = lm_logits[batch_doc_id, -trg_len-1:-1, :]
-        labels = target_ids[batch_doc_id, -trg_len:]
-        loss = loss_fct(lm_logits, labels)
-        token_ppls = loss.cpu()
-        tokens_to_predict = labels.view(-1).cpu().tolist()
-        loss = token_ppls.sum()
-
-    return loss, chosen_doc_id, token_ppls.tolist(), tokens_to_predict
+    return pre_token_ppls.sum(), post_token_ppls.sum(), \
+            pre_token_ppls.tolist(), post_token_ppls.tolist(), tokens_to_predict
 
 
 def eval_dataset(
@@ -105,10 +73,9 @@ def eval_dataset(
         normalization_level="word",
         retrieval_dataset=None,
         retrieval_max_length=256,
-        ranking_strategy="first",
-        num_docs_to_rank=1,
-        num_tokens_to_rank_logprob=16
+        num_docs=10
 ):
+
     encodings = tokenizer(dataset, add_special_tokens=False, return_tensors="pt")
 
     print("Max context length:", max_length)
@@ -125,18 +92,18 @@ def eval_dataset(
 
     print("Normalization factor (num tokens/words..):", counter)
 
-    # for KNN-LM
-    knn_lambda = getattr(model, "knn_lambda", 0.0)
-
-    nlls = []
     prev_end_loc = 0
 
     idx = 0
-    all_token_ppls = []
+    pre_nlls = []
+    post_nlls = []
+    all_pre_token_ppls = []
+    all_post_token_ppls = [] 
     all_tokens_to_predict = []
-    all_chosen_doc_ids = [None]
     num_inputs_no_retrieval = 0
-    for begin_loc in tqdm(range(0, dataset_len, stride)):
+    running_tokens_to_predict = 0
+    pbar = tqdm(range(0, dataset_len, stride))
+    for begin_loc in pbar:
         end_loc = min(begin_loc + max_length, dataset_len)
         trg_len = end_loc - prev_end_loc  # may be different from stride on last loop
         if idx > 0 and retrieval_dataset is not None and len(retrieval_dataset[idx]["retrieved_docs"]) > 0:
@@ -144,23 +111,27 @@ def eval_dataset(
             assert retrieved_example["begin_location"] == prev_end_loc
             assert retrieved_example["end_location"] == end_loc
 
-            neg_log_likelihood, chosen_doc_id, token_ppls, tokens_to_predict = evaluate_logprob_with_retrieved_docs(
+            pre_nll, post_nll, pre_token_ppls, post_token_ppls, tokens_to_predict = evaluate_logprob_with_retrieved_docs(
                 model, tokenizer, device, encodings, begin_loc, end_loc, trg_len, retrieved_example,
-                ranking_strategy=ranking_strategy,
-                num_tokens_to_rank=num_tokens_to_rank_logprob,
-                retrieval_max_length=retrieval_max_length,
-                num_docs=num_docs_to_rank
             )
-            all_chosen_doc_ids.append(chosen_doc_id)
+
+            # ****** TODO: to be moved **********
+            pre_nlls.append(pre_nll)
+            post_nlls.append(post_nll)
+            all_pre_token_ppls.append(pre_token_ppls)
+            all_post_token_ppls.append(post_token_ppls)
+            all_tokens_to_predict.append(tokens_to_predict)
+            assert len(all_pre_token_ppls) == len(all_tokens_to_predict)
+
+            running_tokens_to_predict += trg_len
+            running_pre_ppl = torch.exp(torch.stack(pre_nlls).sum() / running_tokens_to_predict).item()
+            running_post_ppl = torch.exp(torch.stack(post_nlls).sum() / running_tokens_to_predict).item()
+            pbar.set_description(f"Pre TTT PPL: {running_pre_ppl:.2f}, Post TTT PPL: {running_post_ppl:.2f}, no retrieval: {num_inputs_no_retrieval}")
         else:
             input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
             target_ids = input_ids.clone()
             target_ids[:, :-trg_len] = -100
 
-            if idx == 0:
-                setattr(model, "knn_lambda", 0.0)
-            else:
-                setattr(model, "knn_lambda", knn_lambda)
             with torch.no_grad():
                 outputs = model(input_ids, labels=target_ids)
 
@@ -180,11 +151,11 @@ def eval_dataset(
                 loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1)).cpu()
                 token_ppls = loss.tolist()
                 tokens_to_predict = labels.view(-1).cpu().tolist()
+
+                pre_nll = post_nll = neg_log_likelihood
+                pre_token_ppls = post_token_ppls = token_ppls
             
-        nlls.append(neg_log_likelihood)
-        all_token_ppls.append(token_ppls)
-        all_tokens_to_predict.append(tokens_to_predict)
-        assert len(all_token_ppls) == len(all_tokens_to_predict)
+            num_inputs_no_retrieval += 1
 
         prev_end_loc = end_loc
         idx += 1
@@ -192,42 +163,32 @@ def eval_dataset(
             break
 
     assert retrieval_dataset is None or len(retrieval_dataset) == idx
-
-    ppl = torch.exp(torch.stack(nlls).sum() / counter).item()
-    print("Perplexity:", ppl)
-    ppl_to_assert = np.exp(sum([sum(x) for x in all_token_ppls]) / counter)
-    assert np.abs(ppl - ppl_to_assert) < 1e-3, f"{ppl:.3f}, {ppl_to_assert:.3f}"
-
+    
+    # TODO: to be removed
+    counter = running_tokens_to_predict
+    pre_ppl = torch.exp(torch.stack(pre_nlls).sum() / counter).item()
+    print("Pre TTT Perplexity:", pre_ppl)
+    post_ppl = torch.exp(torch.stack(post_nlls).sum() / counter).item()
+    print("Post TTT Perplexity:", post_ppl)
+    
     if output_dir is not None:
-        d = {"eval_perplexity": ppl}
+        d = {"eval_pre_ppl": pre_ppl, "eval_post_ppl": post_ppl}
         if retrieval_dataset is not None:
             d["num_input_no_retrieval"] = num_inputs_no_retrieval
         with open(os.path.join(output_dir, "eval.json"), "w") as f:
             f.write(json.dumps(d) + "\n")
 
         with open(os.path.join(output_dir, "ppls.pkl"), "wb") as f:
-            to_dump = (all_token_ppls, all_tokens_to_predict, all_chosen_doc_ids) if all_chosen_doc_ids \
-                else (all_token_ppls, all_tokens_to_predict)
+            to_dump = (all_pre_token_ppls, all_post_token_ppls, all_tokens_to_predict)
             pickle.dump(to_dump, f)
 
-
+    
 def main(args):
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
     print_args(args, output_dir=args.output_dir)
 
-    if args.use_knn:
-        assert args.knnlm_index_path is not None and args.knnlm_vals_path is not None, "KNN-LM index and vals paths are required"
-        model, tokenizer, config, device = load_knnlm_and_tokenizer(
-            args.model_name, 
-            args.knnlm_index_path, args.knnlm_vals_path, k=args.knnlm_topk, knn_lambda=args.knn_lambda, 
-            model_parallelism=args.model_parallelism, cache_dir=args.cache_dir,
-            auth_token=args.auth_token
-        )
-    else:
-        model, tokenizer, config, device = load_model_and_tokenizer(
-            args.model_name, model_parallelism=args.model_parallelism, cache_dir=args.cache_dir, auth_token=args.auth_token
-        )
+    model, tokenizer, config, device = load_tttlm_and_tokenizer(args.model_name, model_parallelism=args.model_parallelism, cache_dir=args.cache_dir, auth_token=args.auth_token)
 
     # Model context size (e.g., 1024 for GPT-2)
     max_length = args.max_length
@@ -259,9 +220,7 @@ def main(args):
         normalization_level=args.normalization_level,
         retrieval_dataset=retrieval_dataset,
         retrieval_max_length=args.retrieved_max_length,
-        ranking_strategy=args.ranking_strategy,
-        num_docs_to_rank=args.num_docs_to_rank,
-        num_tokens_to_rank_logprob=args.ranking_logprob_past_tokens,
+        num_docs=10
     )
 
 
@@ -289,16 +248,6 @@ if __name__ == '__main__':
     # retrieval params
     parser.add_argument("--retrieved_file", type=str, default=None)
     parser.add_argument("--retrieved_max_length", type=int, default=256)
-    parser.add_argument("--ranking_strategy", type=str, choices=["first", "logprob", "oracle", "random"], default="first")
-    parser.add_argument("--num_docs_to_rank", type=int, default=-1)
-    parser.add_argument("--ranking_logprob_past_tokens", type=int, default=16)
-
-    # KNN-LM args
-    parser.add_argument("--use_knn", action="store_true")
-    parser.add_argument("--knnlm_index_path", type=str, default=None)
-    parser.add_argument("--knnlm_vals_path", type=str, default=None)
-    parser.add_argument("--knn_lambda", type=float, default=0.25)
-    parser.add_argument("--knnlm_topk", type=int, default=1024) 
 
     args = parser.parse_args()
 

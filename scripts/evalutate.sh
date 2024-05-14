@@ -27,25 +27,38 @@ OUTPUT_DIR=/data/user_data/rsadhukh/wikitext/results
 stride=64
 RETRIEVAL_FILE=/data/user_data/rsadhukh/wikitext/dense_retrieved_stride${stride}
 
-python3 eval_lm.py \
---model_name $MODEL_NAME \
---dataset_path EleutherAI/wikitext_document_level \
---dataset_name wikitext-103-v1 \
---dataset_split test \
---text_col page \
---output_dir $OUTPUT_DIR \
---stride $stride \
---max_length 1024 \
---normalization_level word \
---retrieved_file $RETRIEVAL_FILE
-
 # python3 eval_lm.py \
-#  --model_name $MODEL_NAME \
-#  --dataset_path wikitext \
-#  --dataset_name wikitext-103-v1 \
-#  --dataset_split test \
-#  --output_dir $OUTPUT_DIR \
-#  --stride 4 \
-#  --max_length 1024 \
-#  --use_knn --knnlm_index_path /data/user_data/rsadhukh/KNN-LM-experiments/checkpoints/gpt2/index_gpt2_116988150_768.indexed \
-#  --knnlm_vals_path /data/user_data/rsadhukh/KNN-LM-experiments/checkpoints/gpt2/dstore_gpt2_116988150_768_vals.npy
+# --model_name $MODEL_NAME \
+# --dataset_path wikitext \
+# --dataset_name wikitext-103-v1 \
+# --dataset_split test \
+# --text_col text \
+# --output_dir $OUTPUT_DIR \
+# --stride $stride \
+# --max_length 1024 \
+# --normalization_level word \
+# --retrieved_file $RETRIEVAL_FILE
+
+python3 eval_lm.py \
+ --model_name $MODEL_NAME \
+ --dataset_path wikitext \
+ --dataset_name wikitext-103-v1 \
+ --dataset_split test \
+ --output_dir $OUTPUT_DIR \
+ --stride 64 \
+ --max_length 1024 \
+ --use_knn --knnlm_index_path /data/user_data/rsadhukh/KNN-LM-experiments/checkpoints/gpt2/index_gpt2_116988150_768.indexed \
+ --knnlm_vals_path /data/user_data/rsadhukh/KNN-LM-experiments/checkpoints/gpt2/dstore_gpt2_116988150_768_vals.npy
+
+######## TTT ########
+# python3 eval_tttlm.py \
+# --model_name $MODEL_NAME \
+# --dataset_path wikitext \
+# --dataset_name wikitext-103-v1 \
+# --dataset_split test \
+# --text_col text \
+# --output_dir $OUTPUT_DIR \
+# --stride $stride \
+# --max_length 1024 \
+# --normalization_level word \
+# --retrieved_file $RETRIEVAL_FILE
